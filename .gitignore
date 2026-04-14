@@ -8,3 +8,4 @@ data/processed/
 data/raw/*.sqlite
 *.sqlite-shm
 *.sqlite-wal
+data/app_state.sqlite

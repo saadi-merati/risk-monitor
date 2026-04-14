@@ -3,15 +3,15 @@ import sqlite3
 from pathlib import Path
 from datetime import date
 
-import pandas as pd
-import streamlit as st
-
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from app.services.persistence import init_state_db, merge_actions, upsert_action
+import pandas as pd
+import streamlit as st
 
+from app.services.persistence import init_state_db, merge_actions, upsert_action
+from app.services.ai_agent import get_analyst_summary
 
 DB_PATH = ROOT_DIR / "data" / "raw" / "risk_monitor_dataset.sqlite"
 SCORED_PATH = ROOT_DIR / "data" / "processed" / "scored_subscribers.csv"
@@ -350,6 +350,64 @@ def render_user_history(
         st.caption(f"{len(user_complaints)} complaint rows")
         st.dataframe(user_complaints, use_container_width=True, hide_index=True)
 
+def render_ai_analyst_panel(
+    selected_row: pd.Series,
+    dashboard_df: pd.DataFrame,
+    users: pd.DataFrame,
+    memberships: pd.DataFrame,
+    payments: pd.DataFrame,
+    complaints: pd.DataFrame,
+) -> None:
+    st.subheader("AI analyst")
+
+    cache_state_key = f"analyst_output_{int(selected_row['user_id'])}"
+
+    if st.button("Generate analyst summary", key=f"generate_analyst_{int(selected_row['user_id'])}"):
+        with st.spinner("Generating analyst summary..."):
+            st.session_state[cache_state_key] = get_analyst_summary(
+                selected_row=selected_row,
+                dashboard_df=dashboard_df,
+                users=users,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+            )
+
+    analyst_output = st.session_state.get(cache_state_key)
+
+    if analyst_output is None:
+        st.caption("Generate the AI analyst summary on demand to control cost.")
+        return
+
+    st.caption(
+        f"Source: {analyst_output.get('source', 'unknown')} | "
+        f"Model: {analyst_output.get('model', 'unknown')} | "
+        f"Prompt: {analyst_output.get('prompt_version', 'unknown')}"
+    )
+
+    st.write("**Summary**")
+    st.write(analyst_output.get("summary", ""))
+
+    st.write("**Behavior observed**")
+    for item in analyst_output.get("behavior_observed", []):
+        st.write(f"- {item}")
+
+    st.write("**Warning signals**")
+    for item in analyst_output.get("warning_signals", []):
+        st.write(f"- {item}")
+
+    st.write("**Comparison to baseline**")
+    for item in analyst_output.get("comparison_to_baseline", []):
+        st.write(f"- {item}")
+
+    st.write("**Decision support**")
+    st.info(analyst_output.get("decision_support", ""))
+
+    missing_information = analyst_output.get("missing_information", [])
+    if missing_information:
+        st.write("**Missing information**")
+        for item in missing_information:
+            st.write(f"- {item}")
 
 def main() -> None:
     init_state_db()
@@ -396,6 +454,14 @@ def main() -> None:
     with col_left:
         render_user_summary(selected_row)
         render_user_history(selected_user_id, users, memberships, payments, complaints)
+        render_ai_analyst_panel(
+            selected_row=selected_row,
+            dashboard_df=dashboard_df,
+            users=users,
+            memberships=memberships,
+            payments=payments,
+            complaints=complaints,
+        )
 
     with col_right:
         render_action_panel(int(selected_user_id), selected_row)
