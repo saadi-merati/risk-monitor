@@ -1,7 +1,6 @@
 import sys
 import sqlite3
 from pathlib import Path
-from datetime import date
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -10,8 +9,15 @@ if str(ROOT_DIR) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from app.services.persistence import init_state_db, merge_actions, upsert_action
-from app.services.ai_agent import get_analyst_summary
+from app.services.ai_agent import get_analyst_summary, get_decision_recommendation
+from app.services.persistence import (
+    init_state_db,
+    merge_actions,
+    upsert_action,
+    log_decision_feedback,
+    get_decision_feedback_history,
+)
+
 
 DB_PATH = ROOT_DIR / "data" / "raw" / "risk_monitor_dataset.sqlite"
 SCORED_PATH = ROOT_DIR / "data" / "processed" / "scored_subscribers.csv"
@@ -409,6 +415,122 @@ def render_ai_analyst_panel(
         for item in missing_information:
             st.write(f"- {item}")
 
+def render_ai_decision_panel(
+    selected_row: pd.Series,
+    dashboard_df: pd.DataFrame,
+    users: pd.DataFrame,
+    memberships: pd.DataFrame,
+    payments: pd.DataFrame,
+    complaints: pd.DataFrame,
+) -> None:
+    st.subheader("AI decider")
+
+    user_id = int(selected_row["user_id"])
+    decision_state_key = f"decision_output_{user_id}"
+    analyst_state_key = f"analyst_output_{user_id}"
+
+    if st.button("Generate action recommendation", key=f"generate_decision_{user_id}"):
+        with st.spinner("Generating action recommendation..."):
+            st.session_state[decision_state_key] = get_decision_recommendation(
+                selected_row=selected_row,
+                dashboard_df=dashboard_df,
+                users=users,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+                analyst_summary=st.session_state.get(analyst_state_key),
+            )
+
+    decision_output = st.session_state.get(decision_state_key)
+
+    if decision_output is None:
+        st.caption("Generate the AI decision recommendation on demand to control cost.")
+        return
+
+    st.caption(
+        f"Source: {decision_output.get('source', 'unknown')} | "
+        f"Model: {decision_output.get('model', 'unknown')} | "
+        f"Prompt: {decision_output.get('prompt_version', 'unknown')}"
+    )
+
+    c1, c2 = st.columns(2)
+    c1.metric("Recommended action", decision_output.get("recommended_action", "unknown"))
+    c2.metric("Confidence", decision_output.get("confidence", "unknown"))
+
+    st.write("**Rationale**")
+    st.info(decision_output.get("rationale", ""))
+
+    st.write("**Supporting evidence**")
+    for item in decision_output.get("supporting_evidence", []):
+        st.write(f"- {item}")
+
+    caution_points = decision_output.get("caution_points", [])
+    if caution_points:
+        st.write("**Caution points**")
+        for item in caution_points:
+            st.write(f"- {item}")
+
+    missing_information = decision_output.get("missing_information", [])
+    if missing_information:
+        st.write("**Missing information**")
+        for item in missing_information:
+            st.write(f"- {item}")
+
+    rejection_reason = st.text_input(
+        "Rejection reason (only if you reject the recommendation)",
+        key=f"rejection_reason_{user_id}",
+    )
+
+    b1, b2 = st.columns(2)
+
+    if b1.button("Accept recommendation", key=f"accept_decision_{user_id}", use_container_width=True):
+        log_decision_feedback(
+            user_id=user_id,
+            recommended_action=decision_output["recommended_action"],
+            confidence=decision_output["confidence"],
+            rationale=decision_output["rationale"],
+            source=decision_output.get("source", "unknown"),
+            model=decision_output.get("model", "unknown"),
+            prompt_version=decision_output.get("prompt_version", "unknown"),
+            operator_response="accepted",
+            rejection_reason=None,
+        )
+
+        action_mapping = {
+            "monitor": "watch",
+            "warn": "watch",
+            "block": "block",
+            "ignore": "none",
+        }
+        mapped_action = action_mapping.get(decision_output["recommended_action"])
+
+        if mapped_action is not None:
+            note = f"Accepted AI recommendation: {decision_output['recommended_action']}."
+            upsert_action(user_id, mapped_action, note=note)
+
+        st.success("Recommendation accepted and logged.")
+        st.rerun()
+
+    if b2.button("Reject recommendation", key=f"reject_decision_{user_id}", use_container_width=True):
+        log_decision_feedback(
+            user_id=user_id,
+            recommended_action=decision_output["recommended_action"],
+            confidence=decision_output["confidence"],
+            rationale=decision_output["rationale"],
+            source=decision_output.get("source", "unknown"),
+            model=decision_output.get("model", "unknown"),
+            prompt_version=decision_output.get("prompt_version", "unknown"),
+            operator_response="rejected",
+            rejection_reason=rejection_reason.strip() if rejection_reason.strip() else None,
+        )
+        st.warning("Recommendation rejected and logged.")
+        st.rerun()
+
+    history_df = get_decision_feedback_history(user_id)
+    if not history_df.empty:
+        st.write("**Decision feedback history**")
+        st.dataframe(history_df, use_container_width=True, hide_index=True)
+
 def main() -> None:
     init_state_db()
 
@@ -438,8 +560,10 @@ def main() -> None:
 
     render_main_table(filtered_df)
 
+    st.divider()
+
     st.subheader("Open a subscriber")
-    st.caption("Choose a subscriber from the filtered list to open the detailed view.")
+    st.caption("Choose a subscriber from the filtered list to open the workspace.")
 
     selected_user_id = st.selectbox(
         "Subscriber",
@@ -449,11 +573,31 @@ def main() -> None:
 
     selected_row = filtered_df[filtered_df["user_id"] == selected_user_id].iloc[0]
 
-    col_left, col_right = st.columns([2, 1])
+    st.markdown(f"## Subscriber workspace — user_id {selected_user_id}")
 
-    with col_left:
-        render_user_summary(selected_row)
-        render_user_history(selected_user_id, users, memberships, payments, complaints)
+    tab_overview, tab_history, tab_analyst, tab_decider = st.tabs(
+        ["Overview", "History", "AI Analyst", "AI Decider"]
+    )
+
+    with tab_overview:
+        left_col, right_col = st.columns([2, 1])
+
+        with left_col:
+            render_user_summary(selected_row)
+
+        with right_col:
+            render_action_panel(int(selected_user_id), selected_row)
+
+    with tab_history:
+        render_user_history(
+            selected_user_id=selected_user_id,
+            users=users,
+            memberships=memberships,
+            payments=payments,
+            complaints=complaints,
+        )
+
+    with tab_analyst:
         render_ai_analyst_panel(
             selected_row=selected_row,
             dashboard_df=dashboard_df,
@@ -463,8 +607,15 @@ def main() -> None:
             complaints=complaints,
         )
 
-    with col_right:
-        render_action_panel(int(selected_user_id), selected_row)
+    with tab_decider:
+        render_ai_decision_panel(
+            selected_row=selected_row,
+            dashboard_df=dashboard_df,
+            users=users,
+            memberships=memberships,
+            payments=payments,
+            complaints=complaints,
+        )
 
 
 if __name__ == "__main__":
