@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 
 from app.services.ai_logging import init_ai_tables, log_ai_call, read_cache, write_cache
-
+from app.services.pattern_detector import build_pattern_candidates
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 PROMPTS_DIR = ROOT_DIR / "prompts"
@@ -655,3 +655,206 @@ def get_decision_recommendation(
             estimated_cost_usd=None,
         )
         return fallback
+    
+def _validate_pattern_detector_output(data: dict[str, Any]) -> dict[str, Any]:
+    required_keys = ["overall_summary", "patterns", "limitations"]
+
+    for key in required_keys:
+        if key not in data:
+            raise ValueError(f"Missing key in pattern detector output: {key}")
+
+    if not isinstance(data["patterns"], list):
+        raise ValueError("Expected list for key: patterns")
+
+    if not isinstance(data["limitations"], list):
+        raise ValueError("Expected list for key: limitations")
+
+    for item in data["patterns"]:
+        if not isinstance(item, dict):
+            raise ValueError("Each pattern entry must be a dict")
+
+        for key in ["pattern_id", "label", "why_suspicious", "recommended_operator_follow_up", "confidence"]:
+            if key not in item:
+                raise ValueError(f"Missing key in pattern entry: {key}")
+
+        if item["confidence"] not in {"low", "medium", "high"}:
+            raise ValueError("Invalid confidence in pattern entry")
+
+    return data
+
+
+def build_pattern_detector_context(
+    dashboard_df: pd.DataFrame,
+    candidate_patterns_df: pd.DataFrame,
+    max_patterns: int = 6,
+) -> dict[str, Any]:
+    candidate_patterns_df = candidate_patterns_df.head(max_patterns).copy()
+
+    pattern_type_counts = (
+        candidate_patterns_df["pattern_type"].value_counts().to_dict()
+        if "pattern_type" in candidate_patterns_df.columns
+        else {}
+    )
+
+    context = {
+        "population": {
+            "subscriber_count": int(len(dashboard_df)),
+            "avg_risk_score": _safe_mean(dashboard_df, "risk_score"),
+            "avg_complaints_count": _safe_mean(dashboard_df, "complaints_count"),
+            "avg_payment_failures_count": _safe_mean(dashboard_df, "payment_failures_count"),
+        },
+        "candidate_pattern_count": int(len(candidate_patterns_df)),
+        "pattern_type_counts": pattern_type_counts,
+        "candidate_patterns": _json_safe(candidate_patterns_df.to_dict(orient="records")),
+    }
+    return context
+
+
+def fallback_pattern_detector_output(context: dict[str, Any]) -> dict[str, Any]:
+    candidate_patterns = context.get("candidate_patterns", [])
+
+    if not candidate_patterns:
+        return {
+            "overall_summary": "No suspicious multi-user cluster was detected from the current deterministic rules.",
+            "patterns": [],
+            "limitations": [
+                "The detector only reviews predefined temporal and behavioral patterns.",
+                "Absence of a detected cluster does not prove absence of abuse.",
+            ],
+        }
+
+    patterns = []
+    for row in candidate_patterns[:5]:
+        score = float(row.get("suspicious_score", 0) or 0)
+        affected_users = int(row.get("affected_users", 0) or 0)
+
+        if score >= 45 or affected_users >= 5:
+            confidence = "high"
+        elif score >= 30 or affected_users >= 3:
+            confidence = "medium"
+        else:
+            confidence = "low"
+
+        pattern_type = row.get("pattern_type", "unknown_pattern")
+        follow_up_map = {
+            "owner_join_burst": "Review the owner account and inspect whether these joins correspond to coordinated onboarding.",
+            "subscription_join_burst": "Inspect the subscription timeline and validate whether the join burst is legitimate.",
+            "failed_payment_burst": "Review payment traces and investigate whether the repeated error pattern indicates coordination or abuse.",
+            "complaint_burst": "Review the owner and the affected subscriptions to understand the cause of the complaint concentration.",
+        }
+
+        patterns.append({
+            "pattern_id": row.get("pattern_id", ""),
+            "label": row.get("label", pattern_type),
+            "why_suspicious": row.get("evidence", "The cluster concentrates multiple users in a short time window."),
+            "recommended_operator_follow_up": follow_up_map.get(
+                pattern_type,
+                "Inspect the cluster manually to confirm whether the concentration reflects legitimate behavior or abuse.",
+            ),
+            "confidence": confidence,
+        })
+
+    return {
+        "overall_summary": f"{len(candidate_patterns)} suspicious candidate cluster(s) were identified from temporal and multi-user behavioral patterns.",
+        "patterns": patterns,
+        "limitations": [
+            "This detector uses predefined clustering rules before any AI summarization.",
+            "Detected clusters are suspicious signals, not confirmed abuse cases.",
+        ],
+    }
+
+
+def get_pattern_detector_summary(
+    dashboard_df: pd.DataFrame,
+    subscriptions: pd.DataFrame,
+    memberships: pd.DataFrame,
+    payments: pd.DataFrame,
+    complaints: pd.DataFrame,
+    min_users: int = 3,
+    top_k: int = 8,
+    max_patterns_for_ai: int = 6,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    init_ai_tables()
+
+    prompt_version = "pattern_detector_v1"
+
+    candidate_patterns_df = build_pattern_candidates(
+        subscriptions=subscriptions,
+        memberships=memberships,
+        payments=payments,
+        complaints=complaints,
+        min_users=min_users,
+        top_k=top_k,
+    )
+
+    context = build_pattern_detector_context(
+        dashboard_df=dashboard_df,
+        candidate_patterns_df=candidate_patterns_df,
+        max_patterns=max_patterns_for_ai,
+    )
+
+    configured_model = os.getenv("AI_MODEL", "fallback")
+    cache_key = _make_cache_key(configured_model, prompt_version, context)
+
+    cached = read_cache(cache_key)
+    if cached is not None:
+        cached["source"] = "cache"
+        return candidate_patterns_df, cached
+
+    try:
+        prompt_text = _load_prompt("pattern_detector_v1.md")
+        output, model, estimated_cost = _call_openai_compatible_json(
+            system_prompt=prompt_text,
+            context=context,
+            validator=_validate_pattern_detector_output,
+        )
+
+        output_with_meta = {
+            **output,
+            "model": model,
+            "prompt_version": prompt_version,
+        }
+
+        write_cache(
+            cache_key=cache_key,
+            user_id=0,
+            role="pattern_detector",
+            model=model,
+            prompt_version=prompt_version,
+            input_payload=context,
+            output_payload=output_with_meta,
+        )
+        log_ai_call(
+            user_id=0,
+            role="pattern_detector",
+            model=model,
+            prompt_version=prompt_version,
+            cache_key=cache_key,
+            input_payload=context,
+            output_payload=output_with_meta,
+            success=True,
+            estimated_cost_usd=estimated_cost,
+        )
+
+        output_with_meta["source"] = "llm"
+        return candidate_patterns_df, output_with_meta
+
+    except Exception as e:
+        fallback = fallback_pattern_detector_output(context)
+        fallback["model"] = configured_model
+        fallback["prompt_version"] = prompt_version
+        fallback["source"] = "fallback"
+
+        log_ai_call(
+            user_id=0,
+            role="pattern_detector",
+            model=configured_model,
+            prompt_version=prompt_version,
+            cache_key=cache_key,
+            input_payload=context,
+            output_payload=fallback,
+            success=False,
+            error_message=str(e),
+            estimated_cost_usd=None,
+        )
+        return candidate_patterns_df, fallback

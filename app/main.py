@@ -9,7 +9,12 @@ if str(ROOT_DIR) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from app.services.ai_agent import get_analyst_summary, get_decision_recommendation
+from app.services.ai_agent import (
+    get_analyst_summary,
+    get_decision_recommendation,
+    get_pattern_detector_summary,
+)
+
 from app.services.persistence import (
     init_state_db,
     merge_actions,
@@ -52,10 +57,11 @@ def load_scored_data() -> pd.DataFrame:
 
 
 @st.cache_data
-def load_raw_tables() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_raw_tables() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     conn = sqlite3.connect(DB_PATH)
     try:
         users = pd.read_sql_query("SELECT * FROM users", conn)
+        subscriptions = pd.read_sql_query("SELECT * FROM subscriptions", conn)
         memberships = pd.read_sql_query("SELECT * FROM memberships", conn)
         payments = pd.read_sql_query("SELECT * FROM payments", conn)
         complaints = pd.read_sql_query("SELECT * FROM complaints", conn)
@@ -64,6 +70,8 @@ def load_raw_tables() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Data
 
     users["signup_date_parsed"] = pd.to_datetime(users["signup_date"], errors="coerce", utc=True)
     users["last_seen_parsed"] = pd.to_datetime(users["last_seen"], errors="coerce", utc=True)
+
+    subscriptions["created_at_parsed"] = pd.to_datetime(subscriptions["created_at"], errors="coerce", utc=True)
 
     memberships["joined_at_parsed"] = pd.to_datetime(memberships["joined_at"], errors="coerce", utc=True)
     memberships["left_at_parsed"] = pd.to_datetime(memberships["left_at"], errors="coerce", utc=True)
@@ -74,7 +82,7 @@ def load_raw_tables() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Data
     complaints["created_at_parsed"] = pd.to_datetime(complaints["created_at"], errors="coerce", utc=True)
     complaints["resolved_at_parsed"] = pd.to_datetime(complaints["resolved_at"], errors="coerce", utc=True)
 
-    return users, memberships, payments, complaints
+    return users, subscriptions, memberships, payments, complaints
 
 
 def build_dashboard_df() -> pd.DataFrame:
@@ -531,6 +539,113 @@ def render_ai_decision_panel(
         st.write("**Decision feedback history**")
         st.dataframe(history_df, use_container_width=True, hide_index=True)
 
+def render_pattern_detector_panel(
+    dashboard_df: pd.DataFrame,
+    subscriptions: pd.DataFrame,
+    memberships: pd.DataFrame,
+    payments: pd.DataFrame,
+    complaints: pd.DataFrame,
+) -> None:
+    st.subheader("Pattern detector")
+    st.caption(
+        "Hybrid approach: deterministic cluster mining over the full dataset, then AI explanation over the top suspicious patterns."
+    )
+
+    min_users = st.slider(
+        "Minimum distinct subscribers per candidate cluster",
+        min_value=3,
+        max_value=8,
+        value=3,
+        step=1,
+        key="pattern_min_users",
+    )
+
+    top_k = st.slider(
+        "Number of candidate clusters to detect",
+        min_value=5,
+        max_value=20,
+        value=8,
+        step=1,
+        key="pattern_top_k",
+    )
+
+    max_patterns_for_ai = st.slider(
+        "Number of top clusters sent to AI",
+        min_value=3,
+        max_value=10,
+        value=6,
+        step=1,
+        key="pattern_max_for_ai",
+    )
+
+    report_state_key = f"pattern_report_{min_users}_{top_k}_{max_patterns_for_ai}"
+
+    if st.button("Generate pattern report", key="generate_pattern_report"):
+        with st.spinner("Detecting suspicious clusters and generating AI summary..."):
+            candidate_patterns_df, pattern_report = get_pattern_detector_summary(
+                dashboard_df=dashboard_df,
+                subscriptions=subscriptions,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+                min_users=min_users,
+                top_k=top_k,
+                max_patterns_for_ai=max_patterns_for_ai,
+            )
+            st.session_state[report_state_key] = {
+                "candidates": candidate_patterns_df,
+                "report": pattern_report,
+            }
+
+    state = st.session_state.get(report_state_key)
+
+    if state is None:
+        st.caption("Generate the pattern report on demand to control cost.")
+        return
+
+    candidate_patterns_df = state["candidates"]
+    pattern_report = state["report"]
+
+    st.caption(
+        f"Source: {pattern_report.get('source', 'unknown')} | "
+        f"Model: {pattern_report.get('model', 'unknown')} | "
+        f"Prompt: {pattern_report.get('prompt_version', 'unknown')}"
+    )
+
+    st.write("**Overall summary**")
+    st.info(pattern_report.get("overall_summary", ""))
+
+    st.write("**Candidate suspicious clusters**")
+    if candidate_patterns_df.empty:
+        st.info("No suspicious cluster was detected with the current settings.")
+    else:
+        display_cols = [
+            "pattern_type",
+            "label",
+            "owner_id",
+            "affected_users",
+            "duration_minutes",
+            "suspicious_score",
+            "evidence",
+        ]
+        existing_cols = [c for c in display_cols if c in candidate_patterns_df.columns]
+        st.dataframe(candidate_patterns_df[existing_cols], use_container_width=True, hide_index=True)
+
+    patterns = pattern_report.get("patterns", [])
+    if patterns:
+        st.write("**AI-reviewed suspicious patterns**")
+        for item in patterns:
+            with st.expander(f"{item.get('label', 'Pattern')} | confidence={item.get('confidence', 'unknown')}"):
+                st.write(f"**Pattern id:** {item.get('pattern_id', '')}")
+                st.write(f"**Why suspicious:** {item.get('why_suspicious', '')}")
+                st.write(f"**Recommended follow-up:** {item.get('recommended_operator_follow_up', '')}")
+
+    limitations = pattern_report.get("limitations", [])
+    if limitations:
+        st.write("**Limitations**")
+        for item in limitations:
+            st.write(f"- {item}")
+
 def main() -> None:
     init_state_db()
 
@@ -543,75 +658,95 @@ def main() -> None:
         st.error(f"Failed to load scored data: {e}")
         st.stop()
 
-    users, memberships, payments, complaints = load_raw_tables()
+    users, subscriptions, memberships, payments, complaints = load_raw_tables()
 
     render_kpis(dashboard_df)
 
     filtered_df = render_filters(dashboard_df)
 
-    if filtered_df.empty:
-        st.warning("No subscriber matches the current filters.")
-        st.stop()
-
-    filtered_df = filtered_df.sort_values(
-        ["risk_score", "complaints_count", "payment_failures_count"],
-        ascending=[False, False, False],
+    dashboard_tab, workspace_tab, patterns_tab = st.tabs(
+        ["Dashboard", "Subscriber Workspace", "Pattern Detector"]
     )
 
-    render_main_table(filtered_df)
+    with dashboard_tab:
+        if filtered_df.empty:
+            st.warning("No subscriber matches the current filters.")
+        else:
+            filtered_df_sorted = filtered_df.sort_values(
+                ["risk_score", "complaints_count", "payment_failures_count"],
+                ascending=[False, False, False],
+            )
+            render_main_table(filtered_df_sorted)
 
-    st.divider()
+    with workspace_tab:
+        if filtered_df.empty:
+            st.warning("No subscriber matches the current filters.")
+            return
 
-    st.subheader("Open a subscriber")
-    st.caption("Choose a subscriber from the filtered list to open the workspace.")
-
-    selected_user_id = st.selectbox(
-        "Subscriber",
-        options=filtered_df["user_id"].tolist(),
-        format_func=lambda x: f"user_id {x}",
-    )
-
-    selected_row = filtered_df[filtered_df["user_id"] == selected_user_id].iloc[0]
-
-    st.markdown(f"## Subscriber workspace — user_id {selected_user_id}")
-
-    tab_overview, tab_history, tab_analyst, tab_decider = st.tabs(
-        ["Overview", "History", "AI Analyst", "AI Decider"]
-    )
-
-    with tab_overview:
-        left_col, right_col = st.columns([2, 1])
-
-        with left_col:
-            render_user_summary(selected_row)
-
-        with right_col:
-            render_action_panel(int(selected_user_id), selected_row)
-
-    with tab_history:
-        render_user_history(
-            selected_user_id=selected_user_id,
-            users=users,
-            memberships=memberships,
-            payments=payments,
-            complaints=complaints,
+        filtered_df_sorted = filtered_df.sort_values(
+            ["risk_score", "complaints_count", "payment_failures_count"],
+            ascending=[False, False, False],
         )
 
-    with tab_analyst:
-        render_ai_analyst_panel(
-            selected_row=selected_row,
-            dashboard_df=dashboard_df,
-            users=users,
-            memberships=memberships,
-            payments=payments,
-            complaints=complaints,
+        st.subheader("Open a subscriber")
+        st.caption("Choose a subscriber from the filtered list to open the workspace.")
+
+        selected_user_id = st.selectbox(
+            "Subscriber",
+            options=filtered_df_sorted["user_id"].tolist(),
+            format_func=lambda x: f"user_id {x}",
         )
 
-    with tab_decider:
-        render_ai_decision_panel(
-            selected_row=selected_row,
+        selected_row = filtered_df_sorted[filtered_df_sorted["user_id"] == selected_user_id].iloc[0]
+
+        st.markdown(f"## Subscriber workspace — user_id {selected_user_id}")
+
+        tab_overview, tab_history, tab_analyst, tab_decider = st.tabs(
+            ["Overview", "History", "AI Analyst", "AI Decider"]
+        )
+
+        with tab_overview:
+            left_col, right_col = st.columns([2, 1])
+
+            with left_col:
+                render_user_summary(selected_row)
+
+            with right_col:
+                render_action_panel(int(selected_user_id), selected_row)
+
+        with tab_history:
+            render_user_history(
+                selected_user_id=selected_user_id,
+                users=users,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+            )
+
+        with tab_analyst:
+            render_ai_analyst_panel(
+                selected_row=selected_row,
+                dashboard_df=dashboard_df,
+                users=users,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+            )
+
+        with tab_decider:
+            render_ai_decision_panel(
+                selected_row=selected_row,
+                dashboard_df=dashboard_df,
+                users=users,
+                memberships=memberships,
+                payments=payments,
+                complaints=complaints,
+            )
+
+    with patterns_tab:
+        render_pattern_detector_panel(
             dashboard_df=dashboard_df,
-            users=users,
+            subscriptions=subscriptions,
             memberships=memberships,
             payments=payments,
             complaints=complaints,
